@@ -44,6 +44,8 @@
 #define  USB_INTS		(USB_VBUS_INT_STATUS | USB_ID_INT_STATUS)
 #define  USB_INT_ENS		(USB_VBUS_INT_EN | USB_ID_INT_EN | USB_VBUS_WAKEUP_EN | USB_ID_PIN_WAKEUP_EN)
 
+extern volatile int smb347_deep_sleep;  // tmtmtm: from smb347-charger.c
+
 typedef void (*callback_t)(enum usb_otg_state to,
 				enum usb_otg_state from, void *args);
 
@@ -167,6 +169,7 @@ void tegra_start_host(struct tegra_otg_data *tegra)
 
 void tegra_stop_host(struct tegra_otg_data *tegra)
 {
+    //dev_info(tegra->otg.dev, "tegra_stop_host\n");
 	if (tegra->pdev) {
 		tegra_usb_otg_host_unregister(tegra->pdev);
 		tegra->pdev = NULL;
@@ -231,21 +234,36 @@ static void irq_work(struct work_struct *work)
 		dev_info(tegra->otg.dev, "%s --> %s\n", tegra_state_name(from),
 					      tegra_state_name(to));
 
-		if (tegra->charger_cb)
-			tegra->charger_cb(to, from, tegra->charger_cb_data);
+        smb347_deep_sleep = 0;
+        dev_info(tegra->otg.dev, "smb347_deep_sleep cleared\n");
 
+		// tmtmtm
 		if (to == OTG_STATE_A_SUSPEND) {
-			if (from == OTG_STATE_A_HOST)
+			if (from == OTG_STATE_A_HOST) {
+                //dev_info(tegra->otg.dev, "tegra->charger_cb() h->s before\n");
+				if (tegra->charger_cb) {
+                    //dev_info(tegra->otg.dev, "tegra->charger_cb() h->s\n");
+					tegra->charger_cb(to, from, tegra->charger_cb_data); // smb347_otg_status()
+				}
 				tegra_stop_host(tegra);
+			}
 			else if (from == OTG_STATE_B_PERIPHERAL && otg->gadget)
 				usb_gadget_vbus_disconnect(otg->gadget);
 		} else if (to == OTG_STATE_B_PERIPHERAL && otg->gadget) {
 			if (from == OTG_STATE_A_SUSPEND)
 				usb_gadget_vbus_connect(otg->gadget);
 		} else if (to == OTG_STATE_A_HOST) {
-			if (from == OTG_STATE_A_SUSPEND)
-			tegra_start_host(tegra);
+			//if (from != OTG_STATE_A_HOST)
+			if (from == OTG_STATE_A_SUSPEND) {
+				if (tegra->charger_cb) {
+                    //dev_info(tegra->otg.dev, "tegra->charger_cb() ?->h\n");
+					tegra->charger_cb(to, from, tegra->charger_cb_data); // smb347_otg_status()
+				}
+                //dev_info(tegra->otg.dev, "tegra->charger_cb() ?->h after\n");
+			    tegra_start_host(tegra);
+            }
 		}
+        dev_info(tegra->otg.dev, "done\n");
 	}
 
 
