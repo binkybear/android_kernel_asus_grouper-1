@@ -4,6 +4,7 @@
  * Battery charger driver for smb347 from summit microelectronics
  *
  * Copyright (c) 2012, NVIDIA Corporation.
+ * Copyright (C) 2013 Timur Mehrvarz
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -110,6 +111,10 @@
 #define ADAPTER_PROTECT_DELAY (4*HZ)
 #define GPIO_AC_OK		TEGRA_GPIO_PV1
 
+/* Global functions declaration */
+int smb347_event_fi(void);
+int smb347_event_fastcharge(void);
+
 /* Functions declaration */
 static int smb347_configure_charger(struct i2c_client *client, int value);
 static int smb347_configure_interrupts(struct i2c_client *client);
@@ -130,20 +135,14 @@ static unsigned int project_id;
 static unsigned int pcba_ver;
 static int gpio_dock_in = 0;
 
-// tmtmtm: also modify 'export KBUILD_BUILD_USER=timur-usbhost-fi-2013-01-01
-//static int fixed_install_mode = 0;
 extern int usbhost_fixed_install_mode;
 extern int usbhost_fastcharge_in_host_mode;
-// TODO: need select threads to dicover value changes
-// when usbhost_fixed_install_mode from 1 to 0: enable slave charging
-// when usbhost_fixed_install_mode from 0 to 1: disable slave charging
-// when usbhost_fastcharge_in_host_mode from 0 to 1: enable fast charging (when in host mode)
-// when usbhost_fastcharge_in_host_mode from 1 to 0: disable fast charging (when in host mode)
+extern int usbhost_hostmode;
 
 volatile int smb347_deep_sleep = 0;  // imported by ehci-tegra.c
 static volatile int host_mode_charging_state = 0;
 static volatile int lastExternalPowerState = 0;
-static volatile int lastOtgState = 0;
+//static volatile int lastOtgState = 0;
 static volatile int lastChargeSlaveDevicesState = 0;
 static volatile int hostmode_waiting_for_power = 0;
 
@@ -264,7 +263,8 @@ static int smb347_configure_otg(struct i2c_client *client, int enableOTG, int ch
 {
 	int ret = 0;
 
-    printk("smb347_configure_otg %d %d %d %d\n",enableOTG, chargeSlaves, stopChargeSlaves, lastOtgState);
+    printk("smb347_configure_otg otg=%d chargeSlaves=%d stopSlaves=%d lastOtg=%d\n",
+      enableOTG, chargeSlaves, stopChargeSlaves, usbhost_hostmode);
 
 	/*Enable volatile writes to registers*/
 	ret = smb347_volatile_writes(client, smb347_ENABLE_WRITE);
@@ -303,7 +303,7 @@ static int smb347_configure_otg(struct i2c_client *client, int enableOTG, int ch
 	}
 
 	if(enableOTG>0) {
-		if(!lastOtgState) {
+		if(!usbhost_hostmode) {
 			printk("smb347_configure_otg enable host mode\n");
 			ret = smb347_update_reg(client, smb347_CMD_REG, 0x10);
 			if (ret < 0) {
@@ -311,10 +311,10 @@ static int smb347_configure_otg(struct i2c_client *client, int enableOTG, int ch
 					  "0x%02x\n", __func__, smb347_CMD_REG);
 				goto error;
 			}
-			lastOtgState = 1;
+			usbhost_hostmode = 1;
 		}
 	} else if(enableOTG==0) {
-		if(lastOtgState) {
+		if(usbhost_hostmode) {
 			printk("smb347_configure_otg disable host mode\n");
 			ret = smb347_read(client, smb347_CMD_REG);
 			if (ret < 0) {
@@ -327,11 +327,11 @@ static int smb347_configure_otg(struct i2c_client *client, int enableOTG, int ch
 				dev_err(&client->dev, "%s: err %d\n", __func__, ret);
 				goto error;
 			}
-			lastOtgState=0;
+			usbhost_hostmode=0;
 		}
 	}
 
-	// tmtmtm: we will never charge slave devices in fixed_install_mode
+	// tmtmtm: we never charge slave devices in fixed_install_mode
 	if(!usbhost_fixed_install_mode) {
 		if(chargeSlaves) {
 			if(!lastChargeSlaveDevicesState) {
@@ -351,7 +351,7 @@ static int smb347_configure_otg(struct i2c_client *client, int enableOTG, int ch
 
 	if(stopChargeSlaves) {
 		if(lastChargeSlaveDevicesState) {
-			//printk("smb347_configure_otg stop charging slaves\n");
+			printk("smb347_configure_otg stop charging slaves\n");
 			/* Configure INOK to be active low */
 			ret = smb347_read(client, smb347_SYSOK_USB3);
 			if (ret < 0) {
@@ -519,7 +519,7 @@ smb347_set_InputCurrentlimit(struct i2c_client *client, u32 current_limit)
 	else
 		setting |= 0x03;
 
-	printk(KERN_INFO "[charger] set cahrger limmit, limit=%u retval =%x setting=%x\n",
+	printk(KERN_INFO "[charger] set charger limit, limit=%u retval =%x setting=%x\n",
 		current_limit, retval, setting);
 
 	ret = smb347_write(client, smb347_CHRG_CRNTS, setting);
@@ -783,7 +783,7 @@ int smb347_hc_mode_callback(bool enable, int cur)
 		}
 	}
 
-	 /* Disable volatile writes to registers */
+	/* Disable volatile writes to registers */
 	ret = smb347_volatile_writes(client, smb347_DISABLE_WRITE);
 	if (ret < 0) {
 		dev_err(&client->dev, "%s() error in configuring charger..\n",
@@ -795,8 +795,6 @@ int smb347_hc_mode_callback(bool enable, int cur)
 	return ret;
 
 error:
-	//if(ret!=0)
-	//	printk(KERN_INFO "smb347_hc_mode_callback ERROR %d\n",ret);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(smb347_hc_mode_callback);
@@ -882,8 +880,8 @@ static void smb347_otg_status(enum usb_otg_state to, enum usb_otg_state from, vo
 	int ret;
 	int newExternalPowerState=0;
 
-	printk("smb347_otg_status from=%d to=%d lastOtgState=%d lastExternalPowerState=%d lastChargeSlaveDevicesState=%d fixed_install_mode=%d\n",
-		from,to,lastOtgState,lastExternalPowerState,lastChargeSlaveDevicesState,usbhost_fixed_install_mode);
+	printk("smb347_otg_status from=%d to=%d hostmode=%d lastExternalPowerState=%d lastChargeSlaveDevicesState=%d fixed_install_mode=%d\n",
+		from,to,usbhost_hostmode,lastExternalPowerState,lastChargeSlaveDevicesState,usbhost_fixed_install_mode);
 
     if(to==10) {
     	// prevent race condition bug: only when going suspend (OTG PULL)
@@ -891,9 +889,9 @@ static void smb347_otg_status(enum usb_otg_state to, enum usb_otg_state from, vo
         // and use host_mode_charging_state's current value (probably charging), 
         // before we call cable_type_detect() (when it will likely switch to not charging)
         // FIXME: but is tegra_usb_resume not only called on OTG PLUG?
-        // FIXME: do I mean "so that tegra_ehci_irq() can run first" ?
+        // FIXME: better "so that tegra_ehci_irq() can run first" ?
 	    schedule_timeout_interruptible(msecs_to_jiffies(100));
-        // when doing this pause, smb347_resume() will call cable_type_detect() before we do below
+        // pausing here, smb347_resume() will call cable_type_detect() before we do (see: below)
 	}
 	
 	cable_type_detect();
@@ -921,11 +919,8 @@ static void smb347_otg_status(enum usb_otg_state to, enum usb_otg_state from, vo
 				// tmtmtm: mobile-mode: we need to be careful NOT to disable charger detection too early
 				// once we start charging slaves ourselfs, we will not be able to detect ext power coming in
 
-				// also: why are we waiting here, if inok_isr_work_function is called on power
-				//       we actually depend on it to arrive in parallel
-
 		        // make external power detectable in case it is coming back
-		        printk("smb347_otg_status make external power detectable\n");
+		        printk("smb347_otg_status make external power detectable1\n");
 		        ret = smb347_configure_interrupts(client);
 		        if (ret < 0)
 			        dev_err(&client->dev, "%s() error in configuring"
@@ -995,11 +990,9 @@ static void smb347_otg_status(enum usb_otg_state to, enum usb_otg_state from, vo
 		}
 	}
 
-	//if(!newExternalPowerState /*&& !lastChargeSlaveDevicesState*/) {
-		// make external power detectable in case it is coming back
-    // FIXME: probably better do this only, if lastChargeSlaveDevicesState is not set
+	// make external power detectable in case it is coming back
 	if(!lastChargeSlaveDevicesState) {
-		printk("smb347_otg_status make external power detectable\n");
+		printk("smb347_otg_status make external power detectable2\n");
 		ret = smb347_configure_interrupts(client);
 		if (ret < 0)
 			dev_err(&client->dev, "%s() error in configuring"
@@ -1007,8 +1000,8 @@ static void smb347_otg_status(enum usb_otg_state to, enum usb_otg_state from, vo
 	}
 
 	lastExternalPowerState = newExternalPowerState;
-	printk("smb347_otg_status DONE lastOtgState=%d externalPowerState=%d chargeSlaveDevicesState=%d\n",
-		lastOtgState,lastExternalPowerState,lastChargeSlaveDevicesState);
+	printk("smb347_otg_status DONE hostmode=%d externalPowerState=%d chargeSlaveDevicesState=%d\n",
+		usbhost_hostmode,lastExternalPowerState,lastChargeSlaveDevicesState);
 }
 
 /* workqueue function */
@@ -1130,7 +1123,7 @@ static int cable_type_detect(void)
                             touch_callback(usb_cable);
 #endif
                         }
-					    host_mode_charging_state = 1;					// tmtmtm
+					    host_mode_charging_state = 1; // tmtmtm
 
 					} else {
 						charger->cur_cable_type = unknow_cable;
@@ -1148,7 +1141,7 @@ static int cable_type_detect(void)
 				charger->cur_cable_type = unknow_cable;
 				printk(KERN_INFO "USBIN=0\n");
 
-				// tmtmtm: battery tab keeps stating "Charging (AC)"
+				// tmtmtm: fix: battery tab keeps stating "Charging (AC)"
 				if(usbhost_fixed_install_mode) {
 					host_mode_charging_state = 0;
 					printk(KERN_INFO "cable_type_detect() disabled host_mode_charging_state ############\n");
@@ -1176,10 +1169,11 @@ static void inok_isr_work_function(struct work_struct *dat)
 	struct i2c_client *client = charger->client;
 
 	// called on power loss/gain, but also if just a bare (non-powered) OTG adapter is pulled
-	printk("inok_isr_work_function lastOtgState=%d lastExternalPowerState=%d lastChargeSlaveDevicesState=%d\n",
-		lastOtgState,lastExternalPowerState,lastChargeSlaveDevicesState);
+	// also if FI is disabled via sysfs
+	printk("inok_isr_work_function hostmode=%d lastExternalPowerState=%d lastChargeSlaveDevicesState=%d\n",
+		usbhost_hostmode,lastExternalPowerState,lastChargeSlaveDevicesState);
 
-	if(lastOtgState>0 && lastExternalPowerState>0) {
+	if(usbhost_hostmode>0 && lastExternalPowerState>0) {
 		// we used to be in externally powered host mode
 		// this means external power was just lost
 		cancel_delayed_work(&charger->curr_limit_work);
@@ -1216,7 +1210,7 @@ static void inok_isr_work_function(struct work_struct *dat)
 			// so we can continue host mode in OTG mode
 			// if we would NOT call smb347_otg_status() here, slave devices would stay without power now
 
-// tmtmtm: we don't want to call this, if OTG-adapter is pulled (not just power)
+			// tmtmtm: we may not want to call this, if the OTG-adapter is pulled (not just power)
 			smb347_otg_status(OTG_STATE_A_HOST,OTG_STATE_A_HOST,NULL);
 		}
 
@@ -1229,13 +1223,15 @@ static void inok_isr_work_function(struct work_struct *dat)
 					        "otg..\n", __func__);
         }
 
-		printk("inok_isr_work_function done lastOtgState=%d lastExternalPowerState=%d lastChargeSlaveDevicesState=%d\n",
-		    lastOtgState,lastExternalPowerState,lastChargeSlaveDevicesState);
+		printk("inok_isr_work_function done hostmode=%d lastExternalPowerState=%d lastChargeSlaveDevicesState=%d\n",
+		    usbhost_hostmode,lastExternalPowerState,lastChargeSlaveDevicesState);
 		return;
 	}
 
 	// we were NOT in externally powered host mode
-	cable_type_detect();
+	if(!lastChargeSlaveDevicesState) {
+		cable_type_detect();
+	}
 	if(charger->cur_cable_type!=1 && charger->cur_cable_type!=3) {
 		// still no power incoming
 		printk("inok_isr_work_function no power lastExternalPowerState=%d\n",lastExternalPowerState);
@@ -1248,14 +1244,16 @@ static void inok_isr_work_function(struct work_struct *dat)
 			lastExternalPowerState = 0;
 		}
 
-        // make external power detectable
-        printk("inok_isr_work_function make external power detectable2\n");
-	    // 2013-01-28: crash here after
-        int ret = smb347_configure_interrupts(client);
-        if (ret < 0)
-	        dev_err(&client->dev, "%s() error in configuring"
-				        "otg..\n", __func__);
-        printk("inok_isr_work_function make external power detectable2 done\n");
+        if(!lastChargeSlaveDevicesState) {
+            // make external power detectable
+            printk("inok_isr_work_function make external power detectable2\n");
+	        // 2013-01-28: crash here after (in the mobile version only?)
+            int ret = smb347_configure_interrupts(client);
+            if (ret < 0)
+	            dev_err(&client->dev, "%s() error in configuring"
+				            "otg..\n", __func__);
+            printk("inok_isr_work_function make external power detectable2 done\n");
+        }
 		return;
 	}
 
@@ -1263,7 +1261,7 @@ static void inok_isr_work_function(struct work_struct *dat)
 	lastExternalPowerState = 1;
 
 	// host_mode_charging_state may have been set by cable_type_detect()
-	if(host_mode_charging_state>0 && lastOtgState==0) {
+	if(host_mode_charging_state>0 && usbhost_hostmode==0) {
 		printk("inok_isr_work_function external power available, start host mode\n");
 		if(smb347_configure_otg(client, 1, 0, lastChargeSlaveDevicesState)<0)
 			dev_err(&client->dev, "%s() error in configuring"
@@ -1271,7 +1269,7 @@ static void inok_isr_work_function(struct work_struct *dat)
 	}
 
 	//smb347_clear_interrupts(client);      // FIXME???
-	printk("inok_isr_work_function external power available lastOtgState=%d\n",lastOtgState);
+	printk("inok_isr_work_function external power available hostmode=%d\n",usbhost_hostmode);
 }
 
 static void dockin_isr_work_function(struct work_struct *dat)
@@ -1367,6 +1365,94 @@ static void smb347_default_setback(void)
 		dev_err(&client->dev, "%s() error in configuring charger..\n", __func__);
 	}
 }
+
+int smb347_event_fi(void) {
+    // called by usbhost.c sysfs change from user space
+	struct i2c_client *client = charger->client;
+	printk("smb347_event_fi %d\n",usbhost_fixed_install_mode);
+/*
+	if(usbhost_fixed_install_mode>0) {
+	    // from OTG to FI
+        // make external power detectable in case it is coming back
+        int ret = smb347_configure_interrupts(client);
+        if (ret < 0)
+	        dev_err(&client->dev, "%s() error in configuring"
+				        "otg..\n", __func__);
+		// battery will be charged
+		ret = smb347_configure_charger(client, 1);
+		if (ret < 0)
+			dev_err(&client->dev, "%s() error in configuring"
+				"otg..\n", __func__);
+
+	    // enable OTG, disable slave charging
+		if(smb347_configure_otg(client, 1, 0, lastChargeSlaveDevicesState)<0)
+			dev_err(&client->dev, "%s() error in configuring"
+				"otg..\n", __func__);
+
+	    // inok_isr_work_function() will now be called
+	    schedule_timeout_interruptible(msecs_to_jiffies(100));
+		cable_type_detect();
+
+	    // FIXME: switching from OTG to FI: does NOT remove power from slave (only briefly; needs OTG-cables to be pulled)
+	    //        will also NOT accept external power now
+
+        // wenn ich anschliessend OTG ziehe und aufstecke, 
+        // fährt alles hoch, nur der DAC wird nicht erkannt (device not accepting address 3, error -32)
+        // erst wenn ich dem DAC den strom ziehe, geht er wieder
+        // ergo: durch das aus- und einschalten von FI wird der DAC temporär gestört
+
+	} else {
+	    // from FI to OTG: enable slave charging
+		printk("enable slave charging lastExternalPowerState=%d\n",lastExternalPowerState);
+		// battery will NOT be charged
+		int ret = smb347_configure_charger(client, 0);
+		if (ret < 0)
+			dev_err(&client->dev, "%s() error in configuring"
+				"otg..\n", __func__);
+		if(lastExternalPowerState) {
+			cancel_delayed_work(&charger->curr_limit_work);
+			cancel_delayed_work(&charger->inok_isr_work);
+			smb347_clear_interrupts(client);
+
+			// make device aware it is now discharging
+			lastExternalPowerState = 0;
+		}
+		// enableOTG, chargeSlaves, don't stopChargeSlaves
+		if(smb347_configure_otg(client, 1, 1, 0)<0)
+			dev_err(&client->dev, "%s() error in configuring"
+				"otg..\n", __func__);
+	    // inok_isr_work_function() will now be called
+
+		// FIXME: switching from FI to OTG (after power being removed): 
+		//        DOES power the slave, but slaves are NOT detected, not even when replugged
+		//        music plays on speaker
+	}
+*/
+}
+
+
+int smb347_event_fastcharge(void) {
+    // called by usbhost.c sysfs change from user space
+	printk("smb347_event_fastcharge %d\n",usbhost_fastcharge_in_host_mode);
+    if(host_mode_charging_state>0) {
+        if(usbhost_fastcharge_in_host_mode) {
+	        printk(KERN_INFO "host mode charging ac\n");
+	        charger->cur_cable_type = ac_cable;
+	        battery_callback(ac_cable);
+#ifdef TOUCH_CALLBACK_ENABLED
+            touch_callback(ac_cable);
+#endif
+        } else {
+	        printk(KERN_INFO "host mode charging usb\n");
+	        charger->cur_cable_type = usb_cable;
+	        battery_callback(usb_cable);
+#ifdef TOUCH_CALLBACK_ENABLED
+            touch_callback(usb_cable);
+#endif
+        }
+    }
+}
+
 
 static int __devinit smb347_probe(struct i2c_client *client,
 			const struct i2c_device_id *id)
